@@ -1,0 +1,46 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# Output of the go coverage tool
+*.coverprofile
+*.out
+
+# Build directories
+bin/
+_build/
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Dependency directories
+Godeps/
+Godeps.json
+vendor/
+
+# Module cache
+/pkg/
+
+# Editor and IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*.tmp
+*.log
+.DS_Store
+Thumbs.db
+
+# IntelliJ
+*.iml
+*.iws
+.idea/
+
+# macOS
+.DS_Store
+
