@@ -44,3 +44,6 @@ Thumbs.db
 # macOS
 .DS_Store
 
+
+.env
+Dockerfile_old

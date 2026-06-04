@@ -30,6 +30,7 @@ jobs:
       - name: Deploy to Cloud Run
         run: |
           gcloud run deploy iossa \
+            --set-env-vars "DATABASE_URL=${{ secrets.DATABASE_URL }},GH_TOKENS=${{ secrets.GH_TOKENS }}" \
             --image asia-south1-docker.pkg.dev/${{ secrets.PROJECT_ID }}/iossa-repo/iossa \
             --region asia-south1 \
             --platform managed \
