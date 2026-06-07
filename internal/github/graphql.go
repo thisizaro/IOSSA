@@ -1,13 +1,13 @@
 package github
 
 import (
-        "context"
-        "fmt"
-        "time"
+	"context"
+	"fmt"
+	"log/slog"
+	"time"
 )
 
 // repoAnalysisQuery fetches repository metadata, issues, and pull requests.
-// Issues are filtered server-side by $since; PRs are filtered client-side.
 const repoAnalysisQuery = `
 query RepoAnalysis(
   $owner: String!
@@ -60,84 +60,122 @@ query RepoAnalysis(
 `
 
 // FetchRepoGraphQL runs paginated GraphQL fetches until all issues and PRs
-// since `since` are collected. Returns repo metadata and all collected nodes.
-//
-// Pagination: loops while issues.pageInfo.hasNextPage OR prs.pageInfo.hasNextPage.
-// PRs are filtered client-side (createdAt >= since); pagination stops when
-// a PR's createdAt falls before `since`.
+// since `since` are collected. Logs every page fetch with counts so you can
+// follow pagination progress in real time.
 func FetchRepoGraphQL(
-        ctx context.Context,
-        client *Client,
-        owner, name string,
-        since time.Time,
+	ctx context.Context,
+	client *Client,
+	owner, name string,
+	since time.Time,
 ) (*GHRepository, []GHIssue, []GHPR, error) {
-        var allIssues []GHIssue
-        var allPRs []GHPR
-        var repoMeta GHRepository
-        metaCollected := false
+	var allIssues []GHIssue
+	var allPRs []GHPR
+	var repoMeta GHRepository
+	metaCollected := false
 
-        issuesDone := false
-        prsDone := false
-        issuesCursor := ""
-        prsCursor := ""
+	issuesDone := false
+	prsDone := false
+	issuesCursor := ""
+	prsCursor := ""
+	page := 0
 
-        for !issuesDone || !prsDone {
-                vars := map[string]any{
-                        "owner": owner,
-                        "name":  name,
-                        "since": since.UTC().Format(time.RFC3339),
-                }
-                if issuesCursor != "" {
-                        vars["issuesCursor"] = issuesCursor
-                }
-                if prsCursor != "" {
-                        vars["prsCursor"] = prsCursor
-                }
+	for !issuesDone || !prsDone {
+		page++
+		vars := map[string]any{
+			"owner": owner,
+			"name":  name,
+			"since": since.UTC().Format(time.RFC3339),
+		}
+		if issuesCursor != "" {
+			vars["issuesCursor"] = issuesCursor
+		}
+		if prsCursor != "" {
+			vars["prsCursor"] = prsCursor
+		}
 
-                var result struct {
-                        Repository GHRepository `json:"repository"`
-                }
-                if err := client.DoGraphQL(ctx, repoAnalysisQuery, vars, &result); err != nil {
-                        return nil, nil, nil, fmt.Errorf("graphql: fetch page: %w", err)
-                }
+		slog.Info("github: graphql page fetch",
+			"repo", owner+"/"+name,
+			"page", page,
+			"issues_done", issuesDone,
+			"prs_done", prsDone,
+			"issues_cursor", issuesCursor != "",
+			"prs_cursor", prsCursor != "",
+		)
 
-                repo := result.Repository
+		var result struct {
+			Repository GHRepository `json:"repository"`
+		}
+		if err := client.DoGraphQL(ctx, repoAnalysisQuery, vars, &result); err != nil {
+			return nil, nil, nil, fmt.Errorf("graphql: fetch page %d: %w", page, err)
+		}
 
-                // Capture metadata once from the first page.
-                if !metaCollected {
-                        repoMeta = repo
-                        metaCollected = true
-                }
+		repo := result.Repository
 
-                // Collect issues (only while not done; avoid re-adding from repeated first pages).
-                if !issuesDone {
-                        allIssues = append(allIssues, repo.Issues.Nodes...)
-                        if repo.Issues.PageInfo.HasNextPage {
-                                issuesCursor = repo.Issues.PageInfo.EndCursor
-                        } else {
-                                issuesDone = true
-                                issuesCursor = ""
-                        }
-                }
+		if !metaCollected {
+			repoMeta = repo
+			metaCollected = true
+			slog.Info("github: repo metadata collected",
+				"repo", repo.NameWithOwner,
+				"stars", repo.StargazerCount,
+				"forks", repo.ForkCount,
+				"has_issues", repo.HasIssuesEnabled,
+			)
+		}
 
-                // Collect PRs, filtering client-side to [since, ∞).
-                if !prsDone {
-                        stopPRs := false
-                        for _, pr := range repo.PullRequests.Nodes {
-                                if pr.CreatedAt.Before(since) {
-                                        stopPRs = true
-                                        break
-                                }
-                                allPRs = append(allPRs, pr)
-                        }
-                        if stopPRs || !repo.PullRequests.PageInfo.HasNextPage {
-                                prsDone = true
-                                prsCursor = ""
-                        } else {
-                                prsCursor = repo.PullRequests.PageInfo.EndCursor
-                        }
-                }
-        }
+		// Collect issues.
+		if !issuesDone {
+			allIssues = append(allIssues, repo.Issues.Nodes...)
+			if repo.Issues.PageInfo.HasNextPage {
+				issuesCursor = repo.Issues.PageInfo.EndCursor
+				slog.Debug("github: issues paginating", "total_so_far", len(allIssues))
+			} else {
+				issuesDone = true
+				issuesCursor = ""
+				slog.Info("github: issues pagination complete", "total", len(allIssues))
+			}
+		}
 
-        return &repoMeta, allIssues, allPRs, nil
+		// Collect PRs, filtering client-side to [since, ∞).
+		if !prsDone {
+			stopPRs := false
+			pageCount := 0
+			for _, pr := range repo.PullRequests.Nodes {
+				if pr.CreatedAt.Before(since) {
+					stopPRs = true
+					slog.Debug("github: pr before since window, stopping pagination",
+						"pr_number", pr.Number,
+						"pr_created_at", pr.CreatedAt.Format(time.RFC3339),
+						"since", since.Format(time.RFC3339),
+					)
+					break
+				}
+				allPRs = append(allPRs, pr)
+				pageCount++
+			}
+			if stopPRs || !repo.PullRequests.PageInfo.HasNextPage {
+				prsDone = true
+				prsCursor = ""
+				slog.Info("github: prs pagination complete", "total", len(allPRs))
+			} else {
+				prsCursor = repo.PullRequests.PageInfo.EndCursor
+				slog.Debug("github: prs paginating", "total_so_far", len(allPRs))
+			}
+		}
+
+		slog.Info("github: graphql page complete",
+			"repo", owner+"/"+name,
+			"page", page,
+			"issues_collected", len(allIssues),
+			"prs_collected", len(allPRs),
+		)
+	}
+
+	slog.Info("github: graphql all pages complete",
+		"repo", owner+"/"+name,
+		"total_pages", page,
+		"total_issues", len(allIssues),
+		"total_prs", len(allPRs),
+	)
+
+	return &repoMeta, allIssues, allPRs, nil
 }

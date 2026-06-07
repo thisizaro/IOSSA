@@ -33,9 +33,9 @@ func BuildResponse(
 
 func computeStats(raw *github.RawSnapshot, tf models.TimeframeInfo) (models.RepoStats, []models.Contributor) {
 	var (
-		newIssues, closedIssues, openIssues                int
-		newPRs, mergedPRs, openPRs, closedUnmergedPRs      int
-		issueCloseTimes, prMergeTimes                      []float64
+		newIssues, closedIssues, openIssues           int
+		newPRs, mergedPRs, openPRs, closedUnmergedPRs int
+		issueCloseTimes, prMergeTimes                 []float64
 	)
 
 	// Issue stats.

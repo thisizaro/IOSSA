@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	rateLimitRequests = 5
+	rateLimitRequests = 50
 	rateLimitWindow   = 60 * time.Second
 	cleanupInterval   = 5 * time.Minute
 )

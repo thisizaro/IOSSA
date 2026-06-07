@@ -1,90 +1,143 @@
 package github
 
 import (
-        "context"
-        "fmt"
-        "log/slog"
-        "sync"
-        "time"
+	"context"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
 )
 
 // CommunityData holds community health indicators for a repository.
 type CommunityData struct {
-        HasCodeOfConduct   bool `json:"has_code_of_conduct"`
-        BeginnerIssueCount int  `json:"beginner_issue_count"`
-        // HasContribGuide is true when the repo contains a CONTRIBUTING.md file.
-        HasContribGuide bool `json:"has_contrib_guide"`
+	HasCodeOfConduct   bool `json:"has_code_of_conduct"`
+	BeginnerIssueCount int  `json:"beginner_issue_count"`
+	HasContribGuide    bool `json:"has_contrib_guide"`
 }
 
 // RawSnapshot is the normalized event list stored in the database.
 // It always covers 90 days of data and is sliced at query time.
 type RawSnapshot struct {
-        Repo      GHRepository `json:"repo"`
-        Issues    []GHIssue    `json:"issues"`
-        PRs       []GHPR       `json:"pull_requests"`
-        Commits   []GHCommit   `json:"commits"`
-        Community CommunityData `json:"community"`
-        FetchedAt time.Time    `json:"fetched_at"`
+	Repo      GHRepository  `json:"repo"`
+	Issues    []GHIssue     `json:"issues"`
+	PRs       []GHPR        `json:"pull_requests"`
+	Commits   []GHCommit    `json:"commits"`
+	Community CommunityData `json:"community"`
+	FetchedAt time.Time     `json:"fetched_at"`
 }
 
 // FetchAll fetches 90 days of data for a repository.
-// It calls FetchRepoGraphQL and FetchCommits concurrently,
-// then checks for CONTRIBUTING.md and builds a RawSnapshot.
+// Runs GraphQL (issues+PRs+meta) and REST commits concurrently for speed.
+// Logs every step so you can see exactly where time is spent.
 func FetchAll(ctx context.Context, client *Client, owner, name string) (*RawSnapshot, error) {
-        since := time.Now().UTC().AddDate(0, 0, -90)
+	since := time.Now().UTC().AddDate(0, 0, -90)
+	fullName := owner + "/" + name
 
-        var (
-                repo     *GHRepository
-                issues   []GHIssue
-                prs      []GHPR
-                commits  []GHCommit
-                gqlErr   error
-                commErr  error
-        )
+	slog.Info("github: starting FetchAll",
+		"repo", fullName,
+		"since", since.Format("2006-01-02"),
+	)
+	fetchStart := time.Now()
 
-        var wg sync.WaitGroup
-        wg.Add(2)
+	var (
+		repo    *GHRepository
+		issues  []GHIssue
+		prs     []GHPR
+		commits []GHCommit
+		gqlErr  error
+		commErr error
+	)
 
-        go func() {
-                defer wg.Done()
-                repo, issues, prs, gqlErr = FetchRepoGraphQL(ctx, client, owner, name, since)
-        }()
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-        go func() {
-                defer wg.Done()
-                commits, commErr = FetchCommits(ctx, client, owner, name, since)
-        }()
+	// Goroutine 1: GraphQL — repo metadata + issues + PRs.
+	go func() {
+		defer wg.Done()
+		slog.Info("github: starting graphql fetch", "repo", fullName)
+		gqlStart := time.Now()
+		repo, issues, prs, gqlErr = FetchRepoGraphQL(ctx, client, owner, name, since)
+		if gqlErr != nil {
+			slog.Error("github: graphql fetch failed",
+				"repo", fullName,
+				"duration_ms", time.Since(gqlStart).Milliseconds(),
+				"err", gqlErr,
+			)
+		} else {
+			slog.Info("github: graphql fetch complete",
+				"repo", fullName,
+				"issues", len(issues),
+				"prs", len(prs),
+				"stars", repo.StargazerCount,
+				"duration_ms", time.Since(gqlStart).Milliseconds(),
+			)
+		}
+	}()
 
-        wg.Wait()
+	// Goroutine 2: REST commits.
+	go func() {
+		defer wg.Done()
+		slog.Info("github: starting commits fetch", "repo", fullName)
+		commStart := time.Now()
+		commits, commErr = FetchCommits(ctx, client, owner, name, since)
+		if commErr != nil {
+			slog.Error("github: commits fetch failed",
+				"repo", fullName,
+				"duration_ms", time.Since(commStart).Milliseconds(),
+				"err", commErr,
+			)
+		} else {
+			slog.Info("github: commits fetch complete",
+				"repo", fullName,
+				"commits", len(commits),
+				"duration_ms", time.Since(commStart).Milliseconds(),
+			)
+		}
+	}()
 
-        if gqlErr != nil {
-                return nil, fmt.Errorf("fetcher: graphql: %w", gqlErr)
-        }
-        if commErr != nil {
-                return nil, fmt.Errorf("fetcher: commits: %w", commErr)
-        }
+	wg.Wait()
 
-        // Check for CONTRIBUTING.md via REST (404 = not found, non-error).
-        contribURL := fmt.Sprintf("%s/repos/%s/%s/contents/CONTRIBUTING.md", RESTBaseURL, owner, name)
-        hasContrib := false
-        if _, err := client.DoREST(ctx, contribURL, nil); err == nil {
-                hasContrib = true
-        } else if err != ErrNotFound {
-                slog.Warn("fetcher: checking CONTRIBUTING.md", "err", err)
-        }
+	if gqlErr != nil {
+		return nil, fmt.Errorf("fetcher: graphql: %w", gqlErr)
+	}
+	if commErr != nil {
+		return nil, fmt.Errorf("fetcher: commits: %w", commErr)
+	}
 
-        community := CommunityData{
-                HasCodeOfConduct:   repo.CodeOfConduct != nil,
-                BeginnerIssueCount: repo.BeginnerIssues.TotalCount,
-                HasContribGuide:    hasContrib,
-        }
+	// Check for CONTRIBUTING.md via REST (404 = not found, not an error).
+	slog.Debug("github: checking CONTRIBUTING.md", "repo", fullName)
+	contribURL := fmt.Sprintf("%s/repos/%s/%s/contents/CONTRIBUTING.md", RESTBaseURL, owner, name)
+	hasContrib := false
+	if _, err := client.DoREST(ctx, contribURL, nil); err == nil {
+		hasContrib = true
+		slog.Debug("github: CONTRIBUTING.md found", "repo", fullName)
+	} else if err != ErrNotFound {
+		slog.Warn("github: CONTRIBUTING.md check error", "repo", fullName, "err", err)
+	}
 
-        return &RawSnapshot{
-                Repo:      *repo,
-                Issues:    issues,
-                PRs:       prs,
-                Commits:   commits,
-                Community: community,
-                FetchedAt: time.Now().UTC(),
-        }, nil
+	community := CommunityData{
+		HasCodeOfConduct:   repo.CodeOfConduct != nil,
+		BeginnerIssueCount: repo.BeginnerIssues.TotalCount,
+		HasContribGuide:    hasContrib,
+	}
+
+	slog.Info("github: FetchAll complete",
+		"repo", fullName,
+		"total_duration_ms", time.Since(fetchStart).Milliseconds(),
+		"issues", len(issues),
+		"prs", len(prs),
+		"commits", len(commits),
+		"beginner_issues", community.BeginnerIssueCount,
+		"has_contrib_guide", community.HasContribGuide,
+		"has_coc", community.HasCodeOfConduct,
+	)
+
+	return &RawSnapshot{
+		Repo:      *repo,
+		Issues:    issues,
+		PRs:       prs,
+		Commits:   commits,
+		Community: community,
+		FetchedAt: time.Now().UTC(),
+	}, nil
 }

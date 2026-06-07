@@ -47,3 +47,6 @@ Thumbs.db
 
 .env
 Dockerfile_old
+
+codemap.go
+.codemap/

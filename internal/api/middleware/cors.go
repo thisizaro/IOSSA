@@ -2,8 +2,10 @@
 package middleware
 
 import (
+	// "fmt"
 	"net/http"
 	"os"
+	// "time"
 )
 
 // CORS returns a middleware that sets Cross-Origin Resource Sharing headers.

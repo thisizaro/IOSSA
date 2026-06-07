@@ -7,6 +7,8 @@ package sqlcgen
 import (
 	"context"
 	"database/sql"
+	// "fmt"
+	// "time"
 )
 
 type DBTX interface {
